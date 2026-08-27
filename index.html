@@ -39,48 +39,67 @@
     const stage = document.getElementById('stage');
     const video = document.getElementById('vid');
 
-    // Peak look times in the 10s clip (left → right → up → down)
-    const LOOK = { left: 1.25, right: 3.75, up: 6.25, down: 8.75 };
-    const NEUTRAL = 0.15;
-    const SMOOTH = 0.28;
+    // Calibrated peak times from the actual clip (seconds)
+    const CENTER = 0.2;
+    const LOOK = {
+      right: 5.0,
+      down: 9.5,
+      left: 2.0,
+      up: 7.5,
+    };
+
+    // Calm motion
+    const DEADZONE = 0.12;
+    const TAU = 0.35;
+    const MAX_STEP = 0.035;
+    const AXIS_BIAS = 1.15;
 
     let ready = false;
     let seeking = false;
-    let target = NEUTRAL;
-    let current = NEUTRAL;
+    let target = CENTER;
+    let current = CENTER;
+    let lastTs = 0;
 
     video.addEventListener('seeking', () => { seeking = true; });
     video.addEventListener('seeked', () => { seeking = false; });
     video.addEventListener('canplaythrough', () => { ready = true; });
     video.load();
-    video.currentTime = NEUTRAL;
+    video.currentTime = CENTER;
     video.play().then(() => video.pause()).catch(() => {});
+
+    function dirFromPointer(nx, ny) {
+      const mag = Math.hypot(nx, ny);
+      if (mag < DEADZONE) return { dir: 'center', strength: 0 };
+
+      const ax = Math.abs(nx) * AXIS_BIAS;
+      const ay = Math.abs(ny);
+      let dir;
+      if (ax >= ay) {
+        dir = nx > 0 ? 'right' : 'left';
+      } else {
+        dir = ny > 0 ? 'down' : 'up';
+      }
+      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
+      return { dir, strength };
+    }
 
     function setFromPointer(clientX, clientY) {
       if (!ready || !Number.isFinite(video.duration) || video.duration <= 0) return;
       const rect = stage.getBoundingClientRect();
-      // -1..1 relative to center (screen Y grows downward)
       let nx = rect.width > 0 ? ((clientX - rect.left) / rect.width) * 2 - 1 : 0;
       let ny = rect.height > 0 ? ((clientY - rect.top) / rect.height) * 2 - 1 : 0;
       nx = Math.max(-1, Math.min(1, nx));
       ny = Math.max(-1, Math.min(1, ny));
 
-      const mag = Math.hypot(nx, ny);
-      if (mag < 0.08) {
-        target = NEUTRAL;
+      const { dir, strength } = dirFromPointer(nx, ny);
+
+      if (dir === 'center' || strength <= 0) {
+        target = CENTER;
         return;
       }
 
-      // Directional weights: mouse right → look right, left → left, up → up, down → down
-      let wL = Math.max(0, -nx);
-      let wR = Math.max(0, nx);
-      let wU = Math.max(0, -ny);
-      let wD = Math.max(0, ny);
-      // Sharpen so the dominant direction wins more clearly
-      wL *= wL; wR *= wR; wU *= wU; wD *= wD;
-      const sum = wL + wR + wU + wD || 1;
-      target =
-        (wL * LOOK.left + wR * LOOK.right + wU * LOOK.up + wD * LOOK.down) / sum;
+      const peak = LOOK[dir];
+      target = CENTER + (peak - CENTER) * strength;
     }
 
     stage.addEventListener('pointermove', (e) => {
@@ -90,11 +109,24 @@
       stage.setPointerCapture(e.pointerId);
       setFromPointer(e.clientX, e.clientY);
     });
+    stage.addEventListener('pointerleave', () => {
+      target = CENTER;
+    });
 
-    function tick() {
+    function tick(ts) {
+      if (!lastTs) lastTs = ts;
+      const dt = Math.min(0.05, (ts - lastTs) / 1000);
+      lastTs = ts;
+
       if (ready && Number.isFinite(video.duration) && video.duration > 0) {
-        current += (target - current) * SMOOTH;
-        if (!seeking && Math.abs(video.currentTime - current) > 0.01) {
+        const alpha = 1 - Math.exp(-dt / TAU);
+        let next = current + (target - current) * alpha;
+        const delta = next - current;
+        if (delta > MAX_STEP) next = current + MAX_STEP;
+        if (delta < -MAX_STEP) next = current - MAX_STEP;
+        current = next;
+
+        if (!seeking && Math.abs(video.currentTime - current) > 0.012) {
           video.currentTime = current;
         }
       }
