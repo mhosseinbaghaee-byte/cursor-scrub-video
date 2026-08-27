@@ -25,15 +25,9 @@
       background: #87030a;
     }
     video {
-      width: auto;
-      height: auto;
-      max-width: 100%;
-      max-height: 100%;
-      aspect-ratio: 16 / 9;
-      object-fit: contain;
-      object-position: center center;
       display: block;
       pointer-events: none;
+      object-fit: fill;
     }
   </style>
 </head>
@@ -44,6 +38,38 @@
   <script>
     const stage = document.getElementById('stage');
     const video = document.getElementById('vid');
+
+    // Deterministic sizing: compute the video's on-screen box in JS so it
+    // exactly matches the native aspect ratio, in pixels. This avoids relying
+    // on CSS aspect-ratio + object-fit, whose interaction is inconsistent
+    // across browsers/WebViews and can leave the browser to paint its own
+    // (black) letterbox INSIDE the video element, which ignores CSS
+    // background colors on some hardware-accelerated video layers.
+    let nativeRatio = 16 / 9;
+
+    function layout() {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let w, h;
+      if (vw / vh > nativeRatio) {
+        h = vh;
+        w = Math.round(h * nativeRatio);
+      } else {
+        w = vw;
+        h = Math.round(w / nativeRatio);
+      }
+      video.style.width = w + 'px';
+      video.style.height = h + 'px';
+    }
+
+    video.addEventListener('loadedmetadata', () => {
+      if (video.videoWidth && video.videoHeight) {
+        nativeRatio = video.videoWidth / video.videoHeight;
+      }
+      layout();
+    });
+    window.addEventListener('resize', layout);
+    layout();
 
     // Peak times calibrated from the clip
     // Spatial circle order (screen coords: +x right, +y down):
