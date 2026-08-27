@@ -39,20 +39,19 @@
     const stage = document.getElementById('stage');
     const video = document.getElementById('vid');
 
-    // Calibrated peak times from the actual clip (seconds)
+    // Peak times calibrated from the clip
+    // Spatial circle order (screen coords: +x right, +y down):
+    // right → down → left → up → right
     const CENTER = 0.2;
-    const LOOK = {
-      right: 5.0,
-      down: 9.5,
-      left: 2.0,
-      up: 7.5,
-    };
+    const KEYS = [
+      { ang: 0,           t: 5.0 },  // right
+      { ang: Math.PI / 2, t: 9.5 },  // down
+      { ang: Math.PI,     t: 2.0 },  // left
+      { ang: -Math.PI / 2, t: 7.5 }, // up
+    ];
 
-    // Calm motion
-    const DEADZONE = 0.12;
-    const TAU = 0.35;
-    const MAX_STEP = 0.035;
-    const AXIS_BIAS = 1.15;
+    const DEADZONE = 0.08;
+    const TAU = 0.18; // responsive but still smooth
 
     let ready = false;
     let seeking = false;
@@ -67,20 +66,41 @@
     video.currentTime = CENTER;
     video.play().then(() => video.pause()).catch(() => {});
 
-    function dirFromPointer(nx, ny) {
-      const mag = Math.hypot(nx, ny);
-      if (mag < DEADZONE) return { dir: 'center', strength: 0 };
+    function normAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
 
-      const ax = Math.abs(nx) * AXIS_BIAS;
-      const ay = Math.abs(ny);
-      let dir;
-      if (ax >= ay) {
-        dir = nx > 0 ? 'right' : 'left';
-      } else {
-        dir = ny > 0 ? 'down' : 'up';
+    // Shortest angular distance from a to b in [-PI, PI]
+    function angDist(a, b) {
+      return normAngle(b - a);
+    }
+
+    // Continuous spatial lookup: for any angle, blend the two nearest KEYS
+    function timeForAngle(angle) {
+      // Find the two neighbors around `angle` on the circle
+      let bestI = 0;
+      let bestD = Infinity;
+      for (let i = 0; i < KEYS.length; i++) {
+        const d = Math.abs(angDist(angle, KEYS[i].ang));
+        if (d < bestD) {
+          bestD = d;
+          bestI = i;
+        }
       }
-      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
-      return { dir, strength };
+
+      const a = KEYS[bestI];
+      // next neighbor in the direction of residual
+      const residual = angDist(a.ang, angle);
+      const step = residual >= 0 ? 1 : -1;
+      const b = KEYS[(bestI + step + KEYS.length) % KEYS.length];
+
+      const span = Math.abs(angDist(a.ang, b.ang)) || 1;
+      const u = Math.min(1, Math.abs(residual) / span);
+      // Smoothstep for softer mid-diagonal blend
+      const s = u * u * (3 - 2 * u);
+      return a.t + (b.t - a.t) * s;
     }
 
     function setFromPointer(clientX, clientY) {
@@ -91,27 +111,26 @@
       nx = Math.max(-1, Math.min(1, nx));
       ny = Math.max(-1, Math.min(1, ny));
 
-      const { dir, strength } = dirFromPointer(nx, ny);
-
-      if (dir === 'center' || strength <= 0) {
+      const mag = Math.hypot(nx, ny);
+      if (mag < DEADZONE) {
         target = CENTER;
         return;
       }
 
-      const peak = LOOK[dir];
-      target = CENTER + (peak - CENTER) * strength;
+      const angle = Math.atan2(ny, nx); // 0=right, PI/2=down, ±PI=left, -PI/2=up
+      const peak = timeForAngle(angle);
+      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
+      // Ease strength so near-center stays closer to neutral
+      const s = strength * strength * (3 - 2 * strength);
+      target = CENTER + (peak - CENTER) * s;
     }
 
-    stage.addEventListener('pointermove', (e) => {
-      setFromPointer(e.clientX, e.clientY);
-    });
+    stage.addEventListener('pointermove', (e) => setFromPointer(e.clientX, e.clientY));
     stage.addEventListener('pointerdown', (e) => {
       stage.setPointerCapture(e.pointerId);
       setFromPointer(e.clientX, e.clientY);
     });
-    stage.addEventListener('pointerleave', () => {
-      target = CENTER;
-    });
+    stage.addEventListener('pointerleave', () => { target = CENTER; });
 
     function tick(ts) {
       if (!lastTs) lastTs = ts;
@@ -120,13 +139,8 @@
 
       if (ready && Number.isFinite(video.duration) && video.duration > 0) {
         const alpha = 1 - Math.exp(-dt / TAU);
-        let next = current + (target - current) * alpha;
-        const delta = next - current;
-        if (delta > MAX_STEP) next = current + MAX_STEP;
-        if (delta < -MAX_STEP) next = current - MAX_STEP;
-        current = next;
-
-        if (!seeking && Math.abs(video.currentTime - current) > 0.012) {
+        current += (target - current) * alpha;
+        if (!seeking && Math.abs(video.currentTime - current) > 0.01) {
           video.currentTime = current;
         }
       }
