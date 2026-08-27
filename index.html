@@ -23,8 +23,19 @@
       width: 100%;
       height: 100%;
       background: #87030a;
+      overflow: hidden;
+    }
+    #bg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      filter: blur(60px) saturate(1.3) brightness(0.95);
+      transform: scale(1.15);
     }
     video {
+      position: relative;
       display: block;
       pointer-events: none;
       object-fit: fill;
@@ -33,11 +44,14 @@
 </head>
 <body>
   <div id="stage">
+    <canvas id="bg"></canvas>
     <video id="vid" src="character-scrub.mp4" muted playsinline preload="auto"></video>
   </div>
   <script>
     const stage = document.getElementById('stage');
     const video = document.getElementById('vid');
+    const bg = document.getElementById('bg');
+    const bgCtx = bg.getContext('2d');
 
     // Deterministic sizing: compute the video's on-screen box in JS so it
     // exactly matches the native aspect ratio, in pixels. This avoids relying
@@ -60,6 +74,10 @@
       }
       video.style.width = w + 'px';
       video.style.height = h + 'px';
+      bg.width = Math.max(1, Math.round(vw / 4));
+      bg.height = Math.max(1, Math.round(vh / 4));
+      bg.style.width = vw + 'px';
+      bg.style.height = vh + 'px';
     }
 
     video.addEventListener('loadedmetadata', () => {
@@ -70,6 +88,32 @@
     });
     window.addEventListener('resize', layout);
     layout();
+
+    // Draw a low-res, blurred, cover-scaled copy of the current video frame
+    // behind it, so the pillar/letterbox area is filled with the video's own
+    // live colors and gradients instead of a flat color — no visible seam
+    // no matter what the window's aspect ratio is.
+    function drawAmbient() {
+      if (video.readyState >= 2 && video.videoWidth) {
+        const vAspect = video.videoWidth / video.videoHeight;
+        const cAspect = bg.width / bg.height;
+        let sw, sh, sx, sy;
+        if (vAspect > cAspect) {
+          sh = video.videoHeight;
+          sw = sh * cAspect;
+          sx = (video.videoWidth - sw) / 2;
+          sy = 0;
+        } else {
+          sw = video.videoWidth;
+          sh = sw / cAspect;
+          sx = 0;
+          sy = (video.videoHeight - sh) / 2;
+        }
+        try {
+          bgCtx.drawImage(video, sx, sy, sw, sh, 0, 0, bg.width, bg.height);
+        } catch (e) {}
+      }
+    }
 
     // Peak times calibrated from the clip
     // Spatial circle order (screen coords: +x right, +y down):
@@ -176,6 +220,7 @@
           video.currentTime = current;
         }
       }
+      drawAmbient();
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
