@@ -35,33 +35,32 @@
       transform: scale(1.15);
     }
     video {
-      position: relative;
+      position: absolute;
       display: block;
       pointer-events: none;
       object-fit: fill;
+      transition: opacity 0.5s ease;
     }
   </style>
 </head>
 <body>
   <div id="stage">
     <canvas id="bg"></canvas>
-    <video id="vid" src="character-scrub.mp4" muted playsinline preload="auto"></video>
+    <video id="gaze" src="character-gaze.mp4" muted playsinline preload="auto" loop></video>
+    <video id="orbit" src="character-orbit.mp4" muted playsinline preload="auto"></video>
   </div>
+
   <script>
     const stage = document.getElementById('stage');
-    const video = document.getElementById('vid');
+    const gaze = document.getElementById('gaze');
+    const orbit = document.getElementById('orbit');
     const bg = document.getElementById('bg');
     const bgCtx = bg.getContext('2d');
 
-    // Deterministic sizing: compute the video's on-screen box in JS so it
-    // exactly matches the native aspect ratio, in pixels. This avoids relying
-    // on CSS aspect-ratio + object-fit, whose interaction is inconsistent
-    // across browsers/WebViews and can leave the browser to paint its own
-    // (black) letterbox INSIDE the video element, which ignores CSS
-    // background colors on some hardware-accelerated video layers.
-    let nativeRatio = 16 / 9;
+    // ---- Deterministic sizing (both clips share the same 21:9 native ratio) ----
+    let nativeRatio = 2206 / 946;
 
-    function layout() {
+    function sizeVideo(v) {
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       let w, h;
@@ -72,155 +71,113 @@
         w = vw;
         h = Math.round(w / nativeRatio);
       }
-      video.style.width = w + 'px';
-      video.style.height = h + 'px';
-      bg.width = Math.max(1, Math.round(vw / 4));
-      bg.height = Math.max(1, Math.round(vh / 4));
-      bg.style.width = vw + 'px';
-      bg.style.height = vh + 'px';
+      v.style.width = w + 'px';
+      v.style.height = h + 'px';
     }
 
-    video.addEventListener('loadedmetadata', () => {
-      if (video.videoWidth && video.videoHeight) {
-        nativeRatio = video.videoWidth / video.videoHeight;
-      }
+    function layout() {
+      sizeVideo(gaze);
+      sizeVideo(orbit);
+      bg.width = Math.max(1, Math.round(window.innerWidth / 4));
+      bg.height = Math.max(1, Math.round(window.innerHeight / 4));
+      bg.style.width = window.innerWidth + 'px';
+      bg.style.height = window.innerHeight + 'px';
+    }
+
+    gaze.addEventListener('loadedmetadata', () => {
+      if (gaze.videoWidth && gaze.videoHeight) nativeRatio = gaze.videoWidth / gaze.videoHeight;
       layout();
     });
     window.addEventListener('resize', layout);
     layout();
 
-    // Draw a low-res, blurred, cover-scaled copy of the current video frame
-    // behind it, so the pillar/letterbox area is filled with the video's own
-    // live colors and gradients instead of a flat color — no visible seam
-    // no matter what the window's aspect ratio is.
-    function drawAmbient() {
-      if (video.readyState >= 2 && video.videoWidth) {
-        const vAspect = video.videoWidth / video.videoHeight;
+    // ---- Ambient blurred backdrop, driven by whichever clip is on top ----
+    function drawAmbient(activeVideo) {
+      if (activeVideo.readyState >= 2 && activeVideo.videoWidth) {
+        const vAspect = activeVideo.videoWidth / activeVideo.videoHeight;
         const cAspect = bg.width / bg.height;
         let sw, sh, sx, sy;
         if (vAspect > cAspect) {
-          sh = video.videoHeight;
+          sh = activeVideo.videoHeight;
           sw = sh * cAspect;
-          sx = (video.videoWidth - sw) / 2;
+          sx = (activeVideo.videoWidth - sw) / 2;
           sy = 0;
         } else {
-          sw = video.videoWidth;
+          sw = activeVideo.videoWidth;
           sh = sw / cAspect;
           sx = 0;
-          sy = (video.videoHeight - sh) / 2;
+          sy = (activeVideo.videoHeight - sh) / 2;
         }
-        try {
-          bgCtx.drawImage(video, sx, sy, sw, sh, 0, 0, bg.width, bg.height);
-        } catch (e) {}
+        try { bgCtx.drawImage(activeVideo, sx, sy, sw, sh, 0, 0, bg.width, bg.height); } catch (e) {}
       }
     }
 
-    // Peak times calibrated from the clip
-    // Spatial circle order (screen coords: +x right, +y down):
-    // right → down → left → up → right
-    const CENTER = 0.2;
-    const KEYS = [
-      { ang: 0,           t: 5.0 },  // right
-      { ang: Math.PI / 2, t: 9.5 },  // down
-      { ang: Math.PI,     t: 2.0 },  // left
-      { ang: -Math.PI / 2, t: 7.5 }, // up
-    ];
+    // ---- Idle (gaze) <-> Active (orbit scrub) state machine ----
+    const IDLE_TIMEOUT = 1200; // ms of no pointer movement before returning to gaze
+    let mode = 'idle';
+    let lastMoveTs = 0;
 
-    const DEADZONE = 0.08;
-    const TAU = 0.18; // responsive but still smooth
-
-    let ready = false;
+    let current = 0;   // orbit's current smoothed time
+    let target = 0;    // orbit's target time from pointer X
     let seeking = false;
-    let target = CENTER;
-    let current = CENTER;
-    let lastTs = 0;
+    const TAU = 0.22;  // smoothing time constant
 
-    video.addEventListener('seeking', () => { seeking = true; });
-    video.addEventListener('seeked', () => { seeking = false; });
-    video.addEventListener('canplaythrough', () => { ready = true; });
-    video.load();
-    video.currentTime = CENTER;
-    video.play().then(() => video.pause()).catch(() => {});
+    orbit.addEventListener('seeking', () => { seeking = true; });
+    orbit.addEventListener('seeked', () => { seeking = false; });
 
-    function normAngle(a) {
-      while (a > Math.PI) a -= Math.PI * 2;
-      while (a < -Math.PI) a += Math.PI * 2;
-      return a;
+    let orbitReady = false;
+    orbit.addEventListener('canplaythrough', () => { orbitReady = true; });
+
+    gaze.play().catch(() => {});
+
+    function enterActive() {
+      if (mode === 'active') return;
+      mode = 'active';
+      gaze.style.opacity = '0';
+      orbit.style.opacity = '1';
     }
 
-    // Shortest angular distance from a to b in [-PI, PI]
-    function angDist(a, b) {
-      return normAngle(b - a);
+    function enterIdle() {
+      if (mode === 'idle') return;
+      mode = 'idle';
+      orbit.style.opacity = '0';
+      gaze.style.opacity = '1';
+      gaze.currentTime = 0;
+      gaze.play().catch(() => {});
     }
 
-    // Continuous spatial lookup: for any angle, blend the two nearest KEYS
-    function timeForAngle(angle) {
-      // Find the two neighbors around `angle` on the circle
-      let bestI = 0;
-      let bestD = Infinity;
-      for (let i = 0; i < KEYS.length; i++) {
-        const d = Math.abs(angDist(angle, KEYS[i].ang));
-        if (d < bestD) {
-          bestD = d;
-          bestI = i;
-        }
-      }
-
-      const a = KEYS[bestI];
-      // next neighbor in the direction of residual
-      const residual = angDist(a.ang, angle);
-      const step = residual >= 0 ? 1 : -1;
-      const b = KEYS[(bestI + step + KEYS.length) % KEYS.length];
-
-      const span = Math.abs(angDist(a.ang, b.ang)) || 1;
-      const u = Math.min(1, Math.abs(residual) / span);
-      // Smoothstep for softer mid-diagonal blend
-      const s = u * u * (3 - 2 * u);
-      return a.t + (b.t - a.t) * s;
-    }
-
-    function setFromPointer(clientX, clientY) {
-      if (!ready || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    function updateTargetFromEvent(clientX) {
       const rect = stage.getBoundingClientRect();
-      let nx = rect.width > 0 ? ((clientX - rect.left) / rect.width) * 2 - 1 : 0;
-      let ny = rect.height > 0 ? ((clientY - rect.top) / rect.height) * 2 - 1 : 0;
-      nx = Math.max(-1, Math.min(1, nx));
-      ny = Math.max(-1, Math.min(1, ny));
-
-      const mag = Math.hypot(nx, ny);
-      if (mag < DEADZONE) {
-        target = CENTER;
-        return;
+      let nx = (clientX - rect.left) / rect.width;
+      nx = Math.max(0, Math.min(1, nx));
+      if (orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
+        target = nx * orbit.duration;
       }
-
-      const angle = Math.atan2(ny, nx); // 0=right, PI/2=down, ±PI=left, -PI/2=up
-      const peak = timeForAngle(angle);
-      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
-      // Ease strength so near-center stays closer to neutral
-      const s = strength * strength * (3 - 2 * strength);
-      target = CENTER + (peak - CENTER) * s;
     }
 
-    stage.addEventListener('pointermove', (e) => setFromPointer(e.clientX, e.clientY));
-    stage.addEventListener('pointerdown', (e) => {
-      stage.setPointerCapture(e.pointerId);
-      setFromPointer(e.clientX, e.clientY);
-    });
-    stage.addEventListener('pointerleave', () => { target = CENTER; });
+    function onPointerMove(e) {
+      lastMoveTs = performance.now();
+      enterActive();
+      updateTargetFromEvent(e.clientX);
+    }
+
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
+    window.addEventListener('pointerdown', onPointerMove, { passive: true });
 
     function tick(ts) {
-      if (!lastTs) lastTs = ts;
-      const dt = Math.min(0.05, (ts - lastTs) / 1000);
-      lastTs = ts;
+      if (mode === 'active' && ts - lastMoveTs > IDLE_TIMEOUT) {
+        enterIdle();
+      }
 
-      if (ready && Number.isFinite(video.duration) && video.duration > 0) {
-        const alpha = 1 - Math.exp(-dt / TAU);
+      if (mode === 'active' && orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
+        const alpha = 1 - Math.exp(-(1 / 60) / TAU);
         current += (target - current) * alpha;
-        if (!seeking && Math.abs(video.currentTime - current) > 0.01) {
-          video.currentTime = current;
+        if (!seeking && Math.abs(orbit.currentTime - current) > 0.008) {
+          orbit.currentTime = current;
         }
       }
-      drawAmbient();
+
+      drawAmbient(mode === 'active' ? orbit : gaze);
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
