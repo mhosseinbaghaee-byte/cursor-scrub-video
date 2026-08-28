@@ -10,283 +10,130 @@
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #87030a;
+      background: #1a0a0c;
       touch-action: none;
       cursor: crosshair;
     }
     #stage {
       position: fixed;
       inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
       width: 100%;
       height: 100%;
-      background: #87030a;
-      overflow: hidden;
+      background: #1a0a0c;
     }
-    #bg {
-      position: absolute;
-      inset: 0;
+    video {
       width: 100%;
       height: 100%;
       object-fit: cover;
-      filter: blur(60px) saturate(1.3) brightness(0.95);
-      transform: scale(1.15);
-    }
-    video {
-      position: absolute;
+      object-position: center center;
       display: block;
       pointer-events: none;
-      object-fit: fill;
-      transition: opacity 0.4s ease;
     }
   </style>
 </head>
 <body>
   <div id="stage">
-    <canvas id="bg"></canvas>
-    <video id="gaze" src="character-gaze.mp4" muted playsinline preload="auto"></video>
-    <video id="orbit" src="character-orbit.mp4" muted playsinline preload="auto"></video>
+    <video id="vid" src="character-scrub.mp4" muted playsinline preload="auto"></video>
   </div>
-
   <script>
     const stage = document.getElementById('stage');
-    const gaze = document.getElementById('gaze');
-    const orbit = document.getElementById('orbit');
-    const bg = document.getElementById('bg');
-    const bgCtx = bg.getContext('2d');
+    const video = document.getElementById('vid');
 
-    // ---- Deterministic sizing (both clips share the same 21:9 native ratio) ----
-    let nativeRatio = 2206 / 946;
+    // 8-direction keyframes from 9391.mp4 (angle in radians, screen: +x right, +y down)
+    const CENTER = 0.12;
+    const KEYS = [
+      { ang: 0,              t: 1.05 },  // right
+      { ang: Math.PI / 4,    t: 2.00 },  // down-right
+      { ang: Math.PI / 2,    t: 3.00 },  // down
+      { ang: 3 * Math.PI / 4,t: 3.45 },  // down-left
+      { ang: Math.PI,        t: 4.05 },  // left
+      { ang: -3 * Math.PI / 4, t: 6.05 }, // up-left
+      { ang: -Math.PI / 2,   t: 5.20 },  // up
+      { ang: -Math.PI / 4,   t: 0.85 },  // up-right
+    ];
 
-    function sizeVideo(v) {
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      let w, h;
-      if (vw / vh > nativeRatio) {
-        h = vh;
-        w = Math.round(h * nativeRatio);
-      } else {
-        w = vw;
-        h = Math.round(w / nativeRatio);
+    const DEADZONE = 0.07;
+    const TAU = 0.14;
+
+    let ready = false;
+    let seeking = false;
+    let target = CENTER;
+    let current = CENTER;
+    let lastTs = 0;
+
+    video.addEventListener('seeking', () => { seeking = true; });
+    video.addEventListener('seeked', () => { seeking = false; });
+    video.addEventListener('canplaythrough', () => { ready = true; });
+    video.load();
+    video.currentTime = CENTER;
+    video.play().then(() => video.pause()).catch(() => {});
+
+    function normAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
+    function angDist(a, b) {
+      return normAngle(b - a);
+    }
+
+    function timeForAngle(angle) {
+      let bestI = 0;
+      let bestD = Infinity;
+      for (let i = 0; i < KEYS.length; i++) {
+        const d = Math.abs(angDist(angle, KEYS[i].ang));
+        if (d < bestD) { bestD = d; bestI = i; }
       }
-      v.style.width = w + 'px';
-      v.style.height = h + 'px';
+      const a = KEYS[bestI];
+      const residual = angDist(a.ang, angle);
+      const step = residual >= 0 ? 1 : -1;
+      const b = KEYS[(bestI + step + KEYS.length) % KEYS.length];
+      const span = Math.abs(angDist(a.ang, b.ang)) || 1;
+      const u = Math.min(1, Math.abs(residual) / span);
+      const s = u * u * (3 - 2 * u);
+      return a.t + (b.t - a.t) * s;
     }
 
-    function layout() {
-      sizeVideo(gaze);
-      sizeVideo(orbit);
-      bg.width = Math.max(1, Math.round(window.innerWidth / 4));
-      bg.height = Math.max(1, Math.round(window.innerHeight / 4));
-      bg.style.width = window.innerWidth + 'px';
-      bg.style.height = window.innerHeight + 'px';
-    }
-
-    gaze.addEventListener('loadedmetadata', () => {
-      if (gaze.videoWidth && gaze.videoHeight) nativeRatio = gaze.videoWidth / gaze.videoHeight;
-      layout();
-    });
-    window.addEventListener('resize', layout);
-    layout();
-
-    // ---- Ambient blurred backdrop, driven by whichever clip is on top ----
-    function drawAmbient(activeVideo) {
-      if (activeVideo.readyState >= 2 && activeVideo.videoWidth) {
-        const vAspect = activeVideo.videoWidth / activeVideo.videoHeight;
-        const cAspect = bg.width / bg.height;
-        let sw, sh, sx, sy;
-        if (vAspect > cAspect) {
-          sh = activeVideo.videoHeight;
-          sw = sh * cAspect;
-          sx = (activeVideo.videoWidth - sw) / 2;
-          sy = 0;
-        } else {
-          sw = activeVideo.videoWidth;
-          sh = sw / cAspect;
-          sx = 0;
-          sy = (activeVideo.videoHeight - sh) / 2;
-        }
-        try { bgCtx.drawImage(activeVideo, sx, sy, sw, sh, 0, 0, bg.width, bg.height); } catch (e) {}
-      }
-    }
-
-    // =========================================================
-    // GAZE VIDEO — driven by cursor ANGLE relative to stage center.
-    // The clip was generated to visit 8 directions in order
-    // (right, lower-right, down, lower-left, left, upper-left,
-    // up, upper-right) evenly spaced, starting and ending on the
-    // neutral center-forward pose. We assume even spacing across
-    // the clip's duration since it wasn't frame-calibrated.
-    // =========================================================
-    const GAZE_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]; // degrees, screen space (0=right, 90=down)
-    let gazeKeyTimes = null; // filled once duration is known
-    let gazeDuration = 0;
-
-    function computeGazeKeys(duration) {
-      gazeDuration = duration;
-      const n = GAZE_ANGLES.length;
-      // 8 direction peaks evenly spaced between the neutral start (t=0) and neutral end (t=duration)
-      gazeKeyTimes = GAZE_ANGLES.map((_, i) => (i + 1) * (duration / (n + 1)));
-    }
-
-    gaze.addEventListener('loadedmetadata', () => {
-      if (Number.isFinite(gaze.duration) && gaze.duration > 0) {
-        computeGazeKeys(gaze.duration);
-      }
-    });
-
-    let gazeSeeking = false;
-    gaze.addEventListener('seeking', () => { gazeSeeking = true; });
-    gaze.addEventListener('seeked', () => { gazeSeeking = false; });
-    let gazeReady = false;
-    gaze.addEventListener('canplaythrough', () => { gazeReady = true; });
-
-    let gazeCurrent = 0;
-    let gazeTarget = 0;
-    const GAZE_TAU = 0.28;
-    const DEADZONE_FRAC = 0.12; // fraction of half-diagonal treated as "looking at camera"
-
-    function angleDiff(a, b) {
-      let d = ((a - b) % 360 + 540) % 360 - 180;
-      return d; // shortest signed difference, -180..180
-    }
-
-    function updateGazeTargetFromPointer(clientX, clientY) {
-      if (!gazeKeyTimes) return;
+    function setFromPointer(clientX, clientY) {
+      if (!ready || !Number.isFinite(video.duration) || video.duration <= 0) return;
       const rect = stage.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      const dx = clientX - cx;
-      const dy = clientY - cy;
-      const radius = Math.hypot(dx, dy);
-      const maxRadius = Math.hypot(rect.width / 2, rect.height / 2);
-      const norm = Math.min(1, radius / maxRadius);
+      let nx = rect.width > 0 ? ((clientX - rect.left) / rect.width) * 2 - 1 : 0;
+      let ny = rect.height > 0 ? ((clientY - rect.top) / rect.height) * 2 - 1 : 0;
+      nx = Math.max(-1, Math.min(1, nx));
+      ny = Math.max(-1, Math.min(1, ny));
 
-      // Angle in degrees, 0 = right, 90 = down (matches GAZE_ANGLES convention)
-      let angle = Math.atan2(dy, dx) * 180 / Math.PI;
-      if (angle < 0) angle += 360;
-
-      // Find two nearest keys around this angle (circular)
-      const n = GAZE_ANGLES.length;
-      let i0 = 0;
-      for (let i = 0; i < n; i++) {
-        if (angleDiff(angle, GAZE_ANGLES[i]) >= 0) i0 = i;
+      const mag = Math.hypot(nx, ny);
+      if (mag < DEADZONE) {
+        target = CENTER;
+        return;
       }
-      const i1 = (i0 + 1) % n;
-      const a0 = GAZE_ANGLES[i0];
-      let a1 = GAZE_ANGLES[i1];
-      let t0 = gazeKeyTimes[i0];
-      let t1 = gazeKeyTimes[i1];
-      if (i1 === 0) { a1 += 360; t1 += gazeDuration; } // wrap past the last key toward key0 of next loop
 
-      const span = a1 - a0;
-      const frac = span > 0 ? Math.max(0, Math.min(1, (angle - a0) / span)) : 0;
-      // smoothstep easing between the two direction keys
-      const eased = frac * frac * (3 - 2 * frac);
-      let angleTarget = t0 + (t1 - t0) * eased;
-      angleTarget = ((angleTarget % gazeDuration) + gazeDuration) % gazeDuration;
-
-      // Neutral (center) point exists at both t=0 and t=duration; pick whichever
-      // is closer to where we currently are, so blending toward it never causes
-      // a big jump.
-      const distTo0 = Math.min(Math.abs(gazeCurrent - 0), gazeDuration - Math.abs(gazeCurrent - 0));
-      const distToD = Math.min(Math.abs(gazeCurrent - gazeDuration), gazeDuration - Math.abs(gazeCurrent - gazeDuration));
-      const neutralTarget = distTo0 <= distToD ? 0 : gazeDuration;
-
-      // Blend between angle-driven target and neutral based on how close the
-      // pointer is to the center (deadzone).
-      const deadT = Math.max(0, Math.min(1, (norm - DEADZONE_FRAC) / (1 - DEADZONE_FRAC)));
-      gazeTarget = neutralTarget + (angleTarget - neutralTarget) * deadT;
+      const angle = Math.atan2(ny, nx);
+      const peak = timeForAngle(angle);
+      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
+      const s = strength * strength * (3 - 2 * strength);
+      target = CENTER + (peak - CENTER) * s;
     }
 
-    // =========================================================
-    // ORBIT VIDEO — driven by click-drag horizontal position.
-    // Continuous 360-degree camera orbit, linear mapping.
-    // =========================================================
-    let orbitSeeking = false;
-    orbit.addEventListener('seeking', () => { orbitSeeking = true; });
-    orbit.addEventListener('seeked', () => { orbitSeeking = false; });
-    let orbitReady = false;
-    orbit.addEventListener('canplaythrough', () => { orbitReady = true; });
-
-    let orbitCurrent = 0;
-    let orbitTarget = 0;
-    const ORBIT_TAU = 0.18;
-    let dragging = false;
-
-    function updateOrbitTargetFromPointer(clientX) {
-      const rect = stage.getBoundingClientRect();
-      let nx = (clientX - rect.left) / rect.width;
-      nx = Math.max(0, Math.min(1, nx));
-      if (orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
-        orbitTarget = nx * orbit.duration;
-      }
-    }
-
-    // =========================================================
-    // Mode switching
-    // =========================================================
-    let mode = 'gaze'; // 'gaze' | 'orbit'
-
-    function enterOrbit() {
-      if (mode === 'orbit') return;
-      mode = 'orbit';
-      gaze.style.opacity = '0';
-      orbit.style.opacity = '1';
-    }
-    function enterGaze() {
-      if (mode === 'gaze') return;
-      mode = 'gaze';
-      orbit.style.opacity = '0';
-      gaze.style.opacity = '1';
-    }
-
-    gaze.style.opacity = '1';
-    orbit.style.opacity = '0';
-
-    window.addEventListener('pointermove', (e) => {
-      if (dragging) {
-        updateOrbitTargetFromPointer(e.clientX);
-      } else {
-        updateGazeTargetFromPointer(e.clientX, e.clientY);
-      }
-    }, { passive: true });
-
-    window.addEventListener('pointerdown', (e) => {
-      dragging = true;
-      enterOrbit();
-      updateOrbitTargetFromPointer(e.clientX);
+    stage.addEventListener('pointermove', (e) => setFromPointer(e.clientX, e.clientY));
+    stage.addEventListener('pointerdown', (e) => {
+      stage.setPointerCapture(e.pointerId);
+      setFromPointer(e.clientX, e.clientY);
     });
-    window.addEventListener('pointerup', () => {
-      dragging = false;
-      enterGaze();
-    });
-    window.addEventListener('pointercancel', () => {
-      dragging = false;
-      enterGaze();
-    });
+    stage.addEventListener('pointerleave', () => { target = CENTER; });
 
-    // =========================================================
-    // Render loop
-    // =========================================================
-    function tick() {
-      if (gazeReady && gazeKeyTimes) {
-        const alpha = 1 - Math.exp(-(1 / 60) / GAZE_TAU);
-        gazeCurrent += (gazeTarget - gazeCurrent) * alpha;
-        if (!gazeSeeking && Math.abs(gaze.currentTime - gazeCurrent) > 0.01) {
-          gaze.currentTime = gazeCurrent;
+    function tick(ts) {
+      if (!lastTs) lastTs = ts;
+      const dt = Math.min(0.05, (ts - lastTs) / 1000);
+      lastTs = ts;
+
+      if (ready && Number.isFinite(video.duration) && video.duration > 0) {
+        const alpha = 1 - Math.exp(-dt / TAU);
+        current += (target - current) * alpha;
+        if (!seeking && Math.abs(video.currentTime - current) > 0.008) {
+          video.currentTime = current;
         }
       }
-      if (orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
-        const alpha = 1 - Math.exp(-(1 / 60) / ORBIT_TAU);
-        orbitCurrent += (orbitTarget - orbitCurrent) * alpha;
-        if (!orbitSeeking && Math.abs(orbit.currentTime - orbitCurrent) > 0.008) {
-          orbit.currentTime = orbitCurrent;
-        }
-      }
-      drawAmbient(mode === 'orbit' ? orbit : gaze);
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
