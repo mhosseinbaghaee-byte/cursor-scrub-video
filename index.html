@@ -39,66 +39,68 @@
     const stage = document.getElementById('stage');
     const video = document.getElementById('vid');
 
-    // 8-direction keyframes from 9391.mp4 (angle in radians, screen: +x right, +y down)
-    const CENTER = 0.12;
+    // 8 directions from 9391.mp4 — times calibrated from frames
+    // screen coords: +x right, +y down
+    const CENTER = 0.15;
     const KEYS = [
-      { ang: 0,              t: 1.05 },  // right
-      { ang: Math.PI / 4,    t: 2.00 },  // down-right
-      { ang: Math.PI / 2,    t: 3.00 },  // down
-      { ang: 3 * Math.PI / 4,t: 3.45 },  // down-left
-      { ang: Math.PI,        t: 4.05 },  // left
-      { ang: -3 * Math.PI / 4, t: 6.05 }, // up-left
-      { ang: -Math.PI / 2,   t: 5.20 },  // up
-      { ang: -Math.PI / 4,   t: 0.85 },  // up-right
+      { ang: 0,               t: 1.10 }, // right
+      { ang: Math.PI * 0.25,  t: 2.05 }, // down-right
+      { ang: Math.PI * 0.50,  t: 3.05 }, // down
+      { ang: Math.PI * 0.75,  t: 3.50 }, // down-left
+      { ang: Math.PI,         t: 4.10 }, // left
+      { ang: -Math.PI * 0.75, t: 6.10 }, // up-left
+      { ang: -Math.PI * 0.50, t: 5.25 }, // up
+      { ang: -Math.PI * 0.25, t: 0.90 }, // up-right
     ];
 
-    const DEADZONE = 0.07;
-    const TAU = 0.14;
+    const DEADZONE = 0.06;
+    const SMOOTH = 0.18; // seconds time-constant
 
     let ready = false;
-    let seeking = false;
     let target = CENTER;
     let current = CENTER;
     let lastTs = 0;
+    let lastSeek = 0;
 
-    video.addEventListener('seeking', () => { seeking = true; });
-    video.addEventListener('seeked', () => { seeking = false; });
-    video.addEventListener('canplaythrough', () => { ready = true; });
-    video.load();
-    video.currentTime = CENTER;
-    video.play().then(() => video.pause()).catch(() => {});
-
-    function normAngle(a) {
-      while (a > Math.PI) a -= Math.PI * 2;
-      while (a < -Math.PI) a += Math.PI * 2;
-      return a;
-    }
-    function angDist(a, b) {
-      return normAngle(b - a);
-    }
-
-    function timeForAngle(angle) {
-      let bestI = 0;
-      let bestD = Infinity;
-      for (let i = 0; i < KEYS.length; i++) {
-        const d = Math.abs(angDist(angle, KEYS[i].ang));
-        if (d < bestD) { bestD = d; bestI = i; }
+    function markReady() {
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        ready = true;
+        try { video.pause(); } catch (_) {}
       }
-      const a = KEYS[bestI];
-      const residual = angDist(a.ang, angle);
-      const step = residual >= 0 ? 1 : -1;
-      const b = KEYS[(bestI + step + KEYS.length) % KEYS.length];
-      const span = Math.abs(angDist(a.ang, b.ang)) || 1;
-      const u = Math.min(1, Math.abs(residual) / span);
-      const s = u * u * (3 - 2 * u);
-      return a.t + (b.t - a.t) * s;
+    }
+
+    video.addEventListener('loadedmetadata', markReady);
+    video.addEventListener('canplay', markReady);
+    video.addEventListener('canplaythrough', markReady);
+    video.addEventListener('loadeddata', markReady);
+
+    video.muted = true;
+    video.playsInline = true;
+    video.load();
+    // kick metadata
+    video.play().then(() => { video.pause(); markReady(); }).catch(() => markReady());
+
+    function nearestKey(angle) {
+      let best = KEYS[0];
+      let bestD = Infinity;
+      for (const k of KEYS) {
+        let d = angle - k.ang;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        d = Math.abs(d);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      return best;
     }
 
     function setFromPointer(clientX, clientY) {
-      if (!ready || !Number.isFinite(video.duration) || video.duration <= 0) return;
-      const rect = stage.getBoundingClientRect();
-      let nx = rect.width > 0 ? ((clientX - rect.left) / rect.width) * 2 - 1 : 0;
-      let ny = rect.height > 0 ? ((clientY - rect.top) / rect.height) * 2 - 1 : 0;
+      if (!ready) markReady();
+      if (!ready) return;
+
+      const w = window.innerWidth || 1;
+      const h = window.innerHeight || 1;
+      let nx = (clientX / w) * 2 - 1;
+      let ny = (clientY / h) * 2 - 1;
       nx = Math.max(-1, Math.min(1, nx));
       ny = Math.max(-1, Math.min(1, ny));
 
@@ -109,29 +111,50 @@
       }
 
       const angle = Math.atan2(ny, nx);
-      const peak = timeForAngle(angle);
-      const strength = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
-      const s = strength * strength * (3 - 2 * strength);
-      target = CENTER + (peak - CENTER) * s;
+      const key = nearestKey(angle);
+      // strength: stronger at edges
+      const strength = Math.min(1, (mag - DEADZONE) / (0.85 - DEADZONE));
+      const s = strength * strength * (3 - 2 * strength); // smoothstep
+      target = CENTER + (key.t - CENTER) * s;
     }
 
-    stage.addEventListener('pointermove', (e) => setFromPointer(e.clientX, e.clientY));
-    stage.addEventListener('pointerdown', (e) => {
-      stage.setPointerCapture(e.pointerId);
+    // Listen on window so nothing can block pointer events
+    window.addEventListener('pointermove', (e) => {
       setFromPointer(e.clientX, e.clientY);
-    });
-    stage.addEventListener('pointerleave', () => { target = CENTER; });
+    }, { passive: true });
+
+    window.addEventListener('mousemove', (e) => {
+      setFromPointer(e.clientX, e.clientY);
+    }, { passive: true });
+
+    window.addEventListener('pointerdown', (e) => {
+      setFromPointer(e.clientX, e.clientY);
+    }, { passive: true });
+
+    window.addEventListener('touchmove', (e) => {
+      if (e.touches && e.touches[0]) {
+        setFromPointer(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: true });
 
     function tick(ts) {
       if (!lastTs) lastTs = ts;
       const dt = Math.min(0.05, (ts - lastTs) / 1000);
       lastTs = ts;
 
-      if (ready && Number.isFinite(video.duration) && video.duration > 0) {
-        const alpha = 1 - Math.exp(-dt / TAU);
+      if (!ready) markReady();
+
+      if (ready) {
+        const alpha = 1 - Math.exp(-dt / SMOOTH);
         current += (target - current) * alpha;
-        if (!seeking && Math.abs(video.currentTime - current) > 0.008) {
-          video.currentTime = current;
+
+        // throttle seeks a bit for smoother decode
+        const now = performance.now();
+        if (Math.abs(video.currentTime - current) > 0.02 && (now - lastSeek) > 16) {
+          try {
+            video.currentTime = current;
+            lastSeek = now;
+          } catch (_) {}
         }
       }
       requestAnimationFrame(tick);
