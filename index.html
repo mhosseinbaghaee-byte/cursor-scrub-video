@@ -4,138 +4,266 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Cursor Gaze</title>
-  <!-- build 2026-08-28-v12front -->
   <style>
     html, body {
       margin: 0;
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #1a0a0c;
+      background: #87030a;
       touch-action: none;
       cursor: crosshair;
+      -webkit-user-select: none;
+      user-select: none;
     }
     #stage {
       position: fixed;
       inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       width: 100%;
       height: 100%;
-      background: #1a0a0c;
+      background: #87030a;
+      overflow: hidden;
     }
-    video {
+    #bg {
+      position: absolute;
+      inset: 0;
       width: 100%;
       height: 100%;
       object-fit: cover;
-      object-position: center center;
+      filter: blur(60px) saturate(1.3) brightness(0.95);
+      transform: scale(1.15);
+    }
+    video {
+      position: absolute;
       display: block;
       pointer-events: none;
+      object-fit: fill;
+      transition: opacity 0.45s ease;
+      will-change: opacity;
     }
   </style>
 </head>
 <body>
   <div id="stage">
-    <video id="vid" src="character-scrub.mp4" muted playsinline preload="auto"></video>
+    <canvas id="bg"></canvas>
+    <video id="gaze" src="character-gaze.mp4" muted playsinline preload="auto"></video>
+    <video id="orbit" src="character-orbit.mp4" muted playsinline preload="auto"></video>
   </div>
+
   <script>
-    const video = document.getElementById('vid');
+    const stage = document.getElementById('stage');
+    const gaze = document.getElementById('gaze');
+    const orbit = document.getElementById('orbit');
+    const bg = document.getElementById('bg');
+    const bgCtx = bg.getContext('2d');
 
-    // 12s front-facing look-around (8d901233)
-    // screen: +x right, +y down
-    const CENTER = 0.25;
-    const KEYS = [
-      { ang: 0,                t: 1.60 }, // right
-      { ang: Math.PI * 0.25,   t: 3.00 }, // down-right
-      { ang: Math.PI * 0.50,   t: 4.05 }, // down
-      { ang: Math.PI * 0.75,   t: 5.10 }, // down-left
-      { ang: Math.PI,          t: 6.05 }, // left
-      { ang: -Math.PI * 0.75,  t: 6.55 }, // up-left
-      { ang: -Math.PI * 0.50,  t: 7.10 }, // up
-      { ang: -Math.PI * 0.25,  t: 1.00 }, // up-right
+    const ratios = { gaze: 16 / 9, orbit: 2206 / 946 };
+
+    function sizeVideo(v, ratio) {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let w, h;
+      if (vw / vh > ratio) {
+        h = vh;
+        w = Math.round(h * ratio);
+      } else {
+        w = vw;
+        h = Math.round(w / ratio);
+      }
+      v.style.width = w + 'px';
+      v.style.height = h + 'px';
+    }
+
+    function layout() {
+      sizeVideo(gaze, ratios.gaze);
+      sizeVideo(orbit, ratios.orbit);
+      bg.width = Math.max(1, Math.round(window.innerWidth / 4));
+      bg.height = Math.max(1, Math.round(window.innerHeight / 4));
+      bg.style.width = window.innerWidth + 'px';
+      bg.style.height = window.innerHeight + 'px';
+    }
+
+    gaze.addEventListener('loadedmetadata', () => {
+      if (gaze.videoWidth && gaze.videoHeight) ratios.gaze = gaze.videoWidth / gaze.videoHeight;
+      layout();
+    });
+    orbit.addEventListener('loadedmetadata', () => {
+      if (orbit.videoWidth && orbit.videoHeight) ratios.orbit = orbit.videoWidth / orbit.videoHeight;
+      layout();
+    });
+    window.addEventListener('resize', layout);
+    layout();
+
+    function drawAmbient(activeVideo) {
+      if (activeVideo.readyState >= 2 && activeVideo.videoWidth) {
+        const vAspect = activeVideo.videoWidth / activeVideo.videoHeight;
+        const cAspect = bg.width / bg.height;
+        let sw, sh, sx, sy;
+        if (vAspect > cAspect) {
+          sh = activeVideo.videoHeight;
+          sw = sh * cAspect;
+          sx = (activeVideo.videoWidth - sw) / 2;
+          sy = 0;
+        } else {
+          sw = activeVideo.videoWidth;
+          sh = sw / cAspect;
+          sx = 0;
+          sy = (activeVideo.videoHeight - sh) / 2;
+        }
+        try { bgCtx.drawImage(activeVideo, sx, sy, sw, sh, 0, 0, bg.width, bg.height); } catch (e) {}
+      }
+    }
+
+    // Keyframe times measured directly from the clip (face-centroid
+    // tracking across every frame), not assumed evenly-spaced.
+    const GAZE_KEYS = [
+      { angle: 0,   t: 1.3 },
+      { angle: 45,  t: 2.67 },
+      { angle: 90,  t: 3.5 },
+      { angle: 135, t: 4.0 },
+      { angle: 180, t: 4.6 },
+      { angle: 225, t: 5.2 },
+      { angle: 270, t: 5.8 },
+      { angle: 315, t: 6.6 },
     ];
+    let gazeDuration = 8.0;
 
-    const DEADZONE = 0.06;
-    const SMOOTH = 0.16;
+    let gazeSeeking = false;
+    gaze.addEventListener('seeking', () => { gazeSeeking = true; });
+    gaze.addEventListener('seeked', () => { gazeSeeking = false; });
+    let gazeReady = false;
+    gaze.addEventListener('canplaythrough', () => { gazeReady = true; });
+    gaze.addEventListener('loadedmetadata', () => {
+      if (Number.isFinite(gaze.duration) && gaze.duration > 0) gazeDuration = gaze.duration;
+    });
 
-    let ready = false;
-    let target = CENTER;
-    let current = CENTER;
-    let lastTs = 0;
-    let lastSeek = 0;
+    let gazeCurrent = 0;
+    let gazeTarget = 0;
+    const GAZE_TAU = 0.28;
+    const DEADZONE_FRAC = 0.12;
 
-    function markReady() {
-      if (Number.isFinite(video.duration) && video.duration > 0) {
-        ready = true;
-        try { video.pause(); } catch (_) {}
+    function angleDiff(a, b) {
+      return ((a - b) % 360 + 540) % 360 - 180;
+    }
+
+    function updateGazeTargetFromPointer(clientX, clientY) {
+      const rect = stage.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = clientX - cx;
+      const dy = clientY - cy;
+      const radius = Math.hypot(dx, dy);
+      const maxRadius = Math.hypot(rect.width / 2, rect.height / 2);
+      const norm = Math.min(1, radius / maxRadius);
+
+      let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      if (angle < 0) angle += 360;
+
+      const n = GAZE_KEYS.length;
+      let i0 = 0;
+      for (let i = 0; i < n; i++) {
+        if (angleDiff(angle, GAZE_KEYS[i].angle) >= 0) i0 = i;
+      }
+      const i1 = (i0 + 1) % n;
+      const a0 = GAZE_KEYS[i0].angle;
+      let a1 = GAZE_KEYS[i1].angle;
+      let t0 = GAZE_KEYS[i0].t;
+      let t1 = GAZE_KEYS[i1].t;
+      if (i1 === 0) { a1 += 360; t1 += gazeDuration; }
+
+      const span = a1 - a0;
+      const frac = span > 0 ? Math.max(0, Math.min(1, (angle - a0) / span)) : 0;
+      const eased = frac * frac * (3 - 2 * frac);
+      let angleTarget = t0 + (t1 - t0) * eased;
+      angleTarget = ((angleTarget % gazeDuration) + gazeDuration) % gazeDuration;
+
+      const distTo0 = Math.min(Math.abs(gazeCurrent - 0), gazeDuration - Math.abs(gazeCurrent - 0));
+      const distToD = Math.min(Math.abs(gazeCurrent - gazeDuration), gazeDuration - Math.abs(gazeCurrent - gazeDuration));
+      const neutralTarget = distTo0 <= distToD ? 0 : gazeDuration;
+
+      const deadT = Math.max(0, Math.min(1, (norm - DEADZONE_FRAC) / (1 - DEADZONE_FRAC)));
+      gazeTarget = neutralTarget + (angleTarget - neutralTarget) * deadT;
+    }
+
+    let orbitSeeking = false;
+    orbit.addEventListener('seeking', () => { orbitSeeking = true; });
+    orbit.addEventListener('seeked', () => { orbitSeeking = false; });
+    let orbitReady = false;
+    orbit.addEventListener('canplaythrough', () => { orbitReady = true; });
+
+    let orbitCurrent = 0;
+    let orbitTarget = 0;
+    const ORBIT_TAU = 0.18;
+    let dragging = false;
+
+    function updateOrbitTargetFromPointer(clientX) {
+      const rect = stage.getBoundingClientRect();
+      let nx = (clientX - rect.left) / rect.width;
+      nx = Math.max(0, Math.min(1, nx));
+      if (orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
+        orbitTarget = nx * orbit.duration;
       }
     }
 
-    video.addEventListener('loadedmetadata', markReady);
-    video.addEventListener('canplay', markReady);
-    video.addEventListener('canplaythrough', markReady);
-    video.addEventListener('loadeddata', markReady);
-    video.muted = true;
-    video.playsInline = true;
-    video.load();
-    video.play().then(() => { video.pause(); markReady(); }).catch(() => markReady());
+    let mode = 'gaze';
 
-    function nearestKey(angle) {
-      let best = KEYS[0];
-      let bestD = Infinity;
-      for (const k of KEYS) {
-        let d = angle - k.ang;
-        while (d > Math.PI) d -= Math.PI * 2;
-        while (d < -Math.PI) d += Math.PI * 2;
-        d = Math.abs(d);
-        if (d < bestD) { bestD = d; best = k; }
-      }
-      return best;
+    function enterOrbit() {
+      if (mode === 'orbit') return;
+      mode = 'orbit';
+      gaze.style.opacity = '0';
+      orbit.style.opacity = '1';
+    }
+    function enterGaze() {
+      if (mode === 'gaze') return;
+      mode = 'gaze';
+      orbit.style.opacity = '0';
+      gaze.style.opacity = '1';
     }
 
-    function setFromPointer(clientX, clientY) {
-      if (!ready) markReady();
-      if (!ready) return;
+    gaze.style.opacity = '1';
+    orbit.style.opacity = '0';
 
-      const w = window.innerWidth || 1;
-      const h = window.innerHeight || 1;
-      let nx = (clientX / w) * 2 - 1;
-      let ny = (clientY / h) * 2 - 1;
-      nx = Math.max(-1, Math.min(1, nx));
-      ny = Math.max(-1, Math.min(1, ny));
-
-      const mag = Math.hypot(nx, ny);
-      if (mag < DEADZONE) {
-        target = CENTER;
-        return;
+    window.addEventListener('pointermove', (e) => {
+      if (dragging) {
+        updateOrbitTargetFromPointer(e.clientX);
+      } else {
+        updateGazeTargetFromPointer(e.clientX, e.clientY);
       }
-
-      const angle = Math.atan2(ny, nx);
-      const key = nearestKey(angle);
-      const strength = Math.min(1, (mag - DEADZONE) / (0.85 - DEADZONE));
-      const s = strength * strength * (3 - 2 * strength);
-      target = CENTER + (key.t - CENTER) * s;
-    }
-
-    window.addEventListener('pointermove', (e) => setFromPointer(e.clientX, e.clientY), { passive: true });
-    window.addEventListener('mousemove', (e) => setFromPointer(e.clientX, e.clientY), { passive: true });
-    window.addEventListener('pointerdown', (e) => setFromPointer(e.clientX, e.clientY), { passive: true });
-    window.addEventListener('touchmove', (e) => {
-      if (e.touches && e.touches[0]) setFromPointer(e.touches[0].clientX, e.touches[0].clientY);
     }, { passive: true });
 
-    function tick(ts) {
-      if (!lastTs) lastTs = ts;
-      const dt = Math.min(0.05, (ts - lastTs) / 1000);
-      lastTs = ts;
-      if (!ready) markReady();
+    window.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      enterOrbit();
+      updateOrbitTargetFromPointer(e.clientX);
+    });
+    window.addEventListener('pointerup', () => {
+      dragging = false;
+      enterGaze();
+    });
+    window.addEventListener('pointercancel', () => {
+      dragging = false;
+      enterGaze();
+    });
 
-      if (ready) {
-        const alpha = 1 - Math.exp(-dt / SMOOTH);
-        current += (target - current) * alpha;
-        const now = performance.now();
-        if (Math.abs(video.currentTime - current) > 0.02 && (now - lastSeek) > 16) {
-          try { video.currentTime = current; lastSeek = now; } catch (_) {}
+    function tick() {
+      if (gazeReady) {
+        const alpha = 1 - Math.exp(-(1 / 60) / GAZE_TAU);
+        gazeCurrent += (gazeTarget - gazeCurrent) * alpha;
+        if (!gazeSeeking && Math.abs(gaze.currentTime - gazeCurrent) > 0.01) {
+          gaze.currentTime = gazeCurrent;
         }
       }
+      if (orbitReady && Number.isFinite(orbit.duration) && orbit.duration > 0) {
+        const alpha = 1 - Math.exp(-(1 / 60) / ORBIT_TAU);
+        orbitCurrent += (orbitTarget - orbitCurrent) * alpha;
+        if (!orbitSeeking && Math.abs(orbit.currentTime - orbitCurrent) > 0.008) {
+          orbit.currentTime = orbitCurrent;
+        }
+      }
+      drawAmbient(mode === 'orbit' ? orbit : gaze);
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
