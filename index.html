@@ -105,36 +105,30 @@
     }
 
     // ---------------------------------------------------------------
-    // Direction keyframes, measured directly from this clip by
-    // tracking the face's pixel centroid across every frame:
-    //   start (neutral, looking at camera): t = 0
-    //   LEFT   peak: t = 2.7
-    //   RIGHT  peak: t = 6.6
-    //   UP     peak: t = 8.58
-    //   DOWN   peak: t = 10.0  (right at the very end of the clip)
-    // This clip is a straight sequence (neutral -> left -> right ->
-    // up -> down), not a circular sweep, so directions are matched
-    // by nearest angle rather than assumed to lie on one smooth
-    // rotational path.
+    // Sequential clip keyframes (neutral → left → right → up → down).
+    // Timeline is NOT circular, so we snap to the nearest cardinal
+    // direction instead of lerping across unrelated poses.
     // ---------------------------------------------------------------
     const KEYS = [
-      { angle: 0,   t: 6.6 },   // right
-      { angle: 90,  t: 10.0 },  // down
-      { angle: 180, t: 2.7 },   // left
+      { angle: 0,   t: 6.6  },  // right
+      { angle: 90,  t: 9.85 },  // down  (near end)
+      { angle: 180, t: 2.7  },  // left
       { angle: 270, t: 8.58 },  // up
     ];
-    const NEUTRAL_T = 0;
-    const DEADZONE_FRAC = 0.14;
+    const NEUTRAL_T = 0.15;
+    const DEADZONE = 0.08;   // smaller so up/down engage sooner
 
     let seeking = false;
     video.addEventListener('seeking', () => { seeking = true; });
     video.addEventListener('seeked', () => { seeking = false; });
     let ready = false;
+    video.addEventListener('loadedmetadata', () => { ready = true; });
     video.addEventListener('canplaythrough', () => { ready = true; });
+    setTimeout(() => { ready = true; }, 1500);
 
     let current = 0;
     let target = 0;
-    const TAU = 0.24;
+    const TAU = 0.16; // snappier response
 
     function angleDiff(a, b) {
       return ((a - b) % 360 + 540) % 360 - 180;
@@ -146,36 +140,33 @@
       const cy = rect.top + rect.height / 2;
       const dx = clientX - cx;
       const dy = clientY - cy;
-      // Per-axis normalization: reaching ANY screen edge (top, bottom,
-      // left, or right) should reach full signal strength, regardless
-      // of the screen's aspect ratio. A single diagonal-based radius
-      // normalization under-weights vertical movement on wide screens
-      // (since half-height is much smaller than the half-diagonal),
-      // which made up/down feel unresponsive.
-      const normX = Math.abs(dx) / (rect.width / 2);
-      const normY = Math.abs(dy) / (rect.height / 2);
-      const norm = Math.min(1, Math.max(normX, normY));
+
+      // Independent axis norm so top/bottom edges reach full strength
+      // on wide screens (vertical travel is shorter than horizontal).
+      const normX = Math.abs(dx) / Math.max(1, rect.width / 2);
+      const normY = Math.abs(dy) / Math.max(1, rect.height / 2);
+      // Boost vertical slightly — users report up/down felt weak
+      const norm = Math.min(1, Math.max(normX, normY * 1.15));
 
       let angle = Math.atan2(dy, dx) * 180 / Math.PI;
       if (angle < 0) angle += 360;
 
-      const n = KEYS.length;
-      let i0 = 0;
-      for (let i = 0; i < n; i++) {
-        if (angleDiff(angle, KEYS[i].angle) >= 0) i0 = i;
+      // Nearest cardinal key by angular distance (no cross-timeline lerp)
+      let bestI = 0;
+      let bestD = 999;
+      for (let i = 0; i < KEYS.length; i++) {
+        const d = Math.abs(angleDiff(angle, KEYS[i].angle));
+        if (d < bestD) {
+          bestD = d;
+          bestI = i;
+        }
       }
-      const i1 = (i0 + 1) % n;
-      let a0 = KEYS[i0].angle;
-      let a1 = KEYS[i1].angle;
-      if (i1 === 0) a1 += 360;
+      const angleTarget = KEYS[bestI].t;
 
-      const span = a1 - a0;
-      const frac = span > 0 ? Math.max(0, Math.min(1, (angle - a0) / span)) : 0;
-      const eased = frac * frac * (3 - 2 * frac);
-      const angleTarget = KEYS[i0].t + (KEYS[i1].t - KEYS[i0].t) * eased;
-
-      const deadT = Math.max(0, Math.min(1, (norm - DEADZONE_FRAC) / (1 - DEADZONE_FRAC)));
-      target = NEUTRAL_T + (angleTarget - NEUTRAL_T) * deadT;
+      const deadT = Math.max(0, Math.min(1, (norm - DEADZONE) / (1 - DEADZONE)));
+      // smoothstep for gentler falloff near center
+      const eased = deadT * deadT * (3 - 2 * deadT);
+      target = NEUTRAL_T + (angleTarget - NEUTRAL_T) * eased;
     }
 
     window.addEventListener('pointermove', (e) => updateTarget(e.clientX, e.clientY), { passive: true });
@@ -185,8 +176,10 @@
       if (ready && Number.isFinite(video.duration) && video.duration > 0) {
         const alpha = 1 - Math.exp(-(1 / 60) / TAU);
         current += (target - current) * alpha;
-        if (!seeking && Math.abs(video.currentTime - current) > 0.008) {
-          video.currentTime = current;
+        // clamp to valid range (down is near the end)
+        const t = Math.max(0, Math.min(video.duration - 0.04, current));
+        if (!seeking && Math.abs(video.currentTime - t) > 0.01) {
+          video.currentTime = t;
         }
       }
       drawAmbient();
