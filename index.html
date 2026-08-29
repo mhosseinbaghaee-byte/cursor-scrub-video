@@ -146,9 +146,15 @@
       const cy = rect.top + rect.height / 2;
       const dx = clientX - cx;
       const dy = clientY - cy;
-      const radius = Math.hypot(dx, dy);
-      const maxRadius = Math.hypot(rect.width / 2, rect.height / 2);
-      const norm = Math.min(1, radius / maxRadius);
+      // Per-axis normalization: reaching ANY screen edge (top, bottom,
+      // left, or right) should reach full signal strength, regardless
+      // of the screen's aspect ratio. A single diagonal-based radius
+      // normalization under-weights vertical movement on wide screens
+      // (since half-height is much smaller than the half-diagonal),
+      // which made up/down feel unresponsive.
+      const normX = Math.abs(dx) / (rect.width / 2);
+      const normY = Math.abs(dy) / (rect.height / 2);
+      const norm = Math.min(1, Math.max(normX, normY));
 
       let angle = Math.atan2(dy, dx) * 180 / Math.PI;
       if (angle < 0) angle += 360;
